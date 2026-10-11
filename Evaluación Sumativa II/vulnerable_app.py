@@ -1,15 +1,32 @@
 from flask import Flask, request, render_template_string, session, redirect, url_for, flash
-from flask_wtf.csrf import CSRFProtect
 from flask_wtf.csrf import CSRFProtect, generate_csrf
+from authlib.integrations.flask_client import OAuth
+from dotenv import load_dotenv
 import sqlite3
 import os
 import hashlib
 
-csrf = CSRFProtect()
+# Fix para evitar MismatchingStateError en HTTP local
+os.environ['AUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app.secret_key = 'clave_secreta_eva2'
+
+csrf = CSRFProtect()
 csrf.init_app(app)
+
+# CONFIGURACIÓN AUTH0 (Corregido con server_metadata_url)
+AUTH0_DOMAIN = os.getenv('AUTH0_DOMAIN')
+oauth = OAuth(app)
+auth0 = oauth.register(
+    'auth0',
+    client_id=os.getenv('AUTH0_CLIENT_ID'),
+    client_secret=os.getenv('AUTH0_CLIENT_SECRET'),
+    server_metadata_url=f'https://{AUTH0_DOMAIN}/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid profile email'},
+)
 
 
 def get_db_connection():
@@ -24,60 +41,36 @@ def hash_password(password):
 
 @app.route('/')
 def index():
-    return 'Welcome to the Task Manager Application!'
+    return 'Welcome to the Task Manager Application! <br><a href="/login">Iniciar Sesión con Auth0</a>'
 
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route('/login')
 def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+    return auth0.authorize_redirect(redirect_uri=url_for('callback', _external=True))
 
-        conn = get_db_connection()
 
-        # Inyección de SQL solo si se detecta un payload de inyección de SQL 
-        
-        """
-        if "' OR '" in password:
-            query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
-            user = conn.execute(query).fetchone()
-        else:
-            query = "SELECT * FROM users WHERE username = ? AND password = ?"
-            hashed_password = hash_password(password)
-            user = conn.execute(query, (username, hashed_password)).fetchone()
-        """
-        # Consulta segura parametrizada
-        query = "SELECT * FROM users WHERE username = ? AND password = ?"
-        hashed_password = hash_password(password)
-        user = conn.execute(query, (username, hashed_password)).fetchone()
-        
-        print("Consulta SQL generada:", query)
+@app.route('/callback')
+def callback():
+    token = auth0.authorize_access_token()
+    
+    # Obtener la información del usuario directamente del token
+    user_info = token.get('userinfo')
+    if not user_info:
+        resp = auth0.get(f'https://{AUTH0_DOMAIN}/userinfo')
+        user_info = resp.json()
 
-        if user:
-            session['user_id'] = user['id']
-            session['role'] = user['role']
-            return redirect(url_for('dashboard'))
-        else:
-            return 'Invalid credentials!'
-    #FORM PROTEGIDO CONTRA CSRF, SE APLICA UN TOKEN CSRF PARA PROTEGER EL FORMULARIO DE INYECCIONES MALICIOSAS
-    return render_template_string('''
-        <form method="post">
-            <input type="hidden" name="csrf_token" value="{{ token }}"/>
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
-            <input type="submit" value="Login">
-        </form>
-    ''', token=generate_csrf())
-        
-    #FORM NO PROTEGIDO CONTRA CSRF, SE DEBE APLICAR UN TOKEN CSRF PARA PROTEGER EL FORMULARIO DE INYECCIONES MALICIOSAS
-    """return '''
-        <form method="post">
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
-            <input type="submit" value="Login">
-        </form>
-    ''' 
-    """
+    session['profile'] = user_info
+    session['user_id'] = user_info.get('name', user_info.get('email'))
+
+    # Cambia esto por tu correo real con el que inicias sesión en Auth0
+    correo_admin = "correo@gmail.com"
+
+    if user_info.get('email') == correo_admin:
+        session['role'] = 'admin'
+    else:
+        session['role'] = 'user'
+
+    return redirect(url_for('dashboard'))
 
 
 @app.route('/dashboard')
@@ -90,11 +83,11 @@ def dashboard():
     tasks = conn.execute(
         "SELECT * FROM tasks WHERE user_id = ?", (user_id,)).fetchall()
     conn.close()
-   
-   
-   #con CSRF token aplicado al formulario para protegerlo de ataques de falsificación de solicitudes entre sitios
+
+    # con CSRF token aplicado al formulario para protegerlo de ataques de falsificación de solicitudes entre sitios
     return render_template_string('''
         <h1>Welcome, user {{ user_id }}!</h1>
+        <p><a href="/admin">Panel Admin</a> | <a href="/logout">Logout</a></p>
         <form action="/add_task" method="post">
             <input type="hidden" name="csrf_token" value="{{ token }}"/>
             <input type="text" name="task" placeholder="New task"><br>
@@ -107,9 +100,8 @@ def dashboard():
         {% endfor %}
         </ul>
     ''', user_id=user_id, tasks=tasks, token=generate_csrf())
-    
-    
-    #SIN SAFE FILTER applied el seguro
+
+    # SIN SAFE FILTER applied el seguro
     """return render_template_string('''
         <h1>Welcome, user {{ user_id }}!</h1>
         <form action="/add_task" method="post">
@@ -123,10 +115,8 @@ def dashboard():
         {% endfor %}
         </ul>
     ''', user_id=user_id, tasks=tasks) """
-    
-    
-#Con safe filter applied to avoid XSS attacks
 
+    # Con safe filter applied to avoid XSS attacks
     """
     return render_template_string('''
             <h1>Welcome, user {{ user_id }}!</h1>
@@ -141,8 +131,7 @@ def dashboard():
             {% endfor %}
             </ul>
         ''', user_id=user_id, tasks=tasks)
-        
-        """
+    """
 
 
 @app.route('/add_task', methods=['POST'])
@@ -177,12 +166,21 @@ def delete_task(task_id):
 
 @app.route('/admin')
 def admin():
-    if 'user_id' not in session or session.get('role') != 'admin':
+    if 'user_id' not in session:
         return redirect(url_for('login'))
+
+    if session.get('role') != 'admin':
+        return 'Acceso denegado: Requiere rol de administrador', 403
 
     return 'Welcome to the admin panel!'
 
 
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(
+        f"https://{AUTH0_DOMAIN}/v2/logout?client_id={os.getenv('AUTH0_CLIENT_ID')}&returnTo={url_for('index', _external=True)}"
+    )
+
 if __name__ == '__main__':
     app.run(debug=True)
-
